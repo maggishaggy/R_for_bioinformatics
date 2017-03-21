@@ -1,0 +1,647 @@
+---
+title: "Integrative Analysis of RNA-seq and small RNA-Seq data"
+author: "Zhuofei Xu"
+date: "28 Dec 2016, second edition"
+output: html_document
+---
+
+# Install R-packages if they are not pre-installed
+### Note that the packages are available from CRAN, Github or Bioconductor
+### You may need to install these locally
+
+```{r, warning=FALSE, message=FALSE, cache.comments=FALSE, eval=FALSE}
+# Install the following packages from Bioconductor
+#source("http://bioconductor.org/biocLite.R")
+#biocLite("DESeq2")
+#biocLite("edgeR")
+#biocLite("org.Hs.eg.db")
+
+# Install the following packages from CRAN
+#packages.cran <- c("pheatmap")
+#if (length(setdiff(packages.cran, rownames(installed.packages()))) > 0) {
+#  install.packages(setdiff(packages.cran, rownames(installed.packages())))
+#}
+
+```
+
+
+# Load libraries by running the codes
+
+```{r, warning=FALSE, message=FALSE, cache.comments=FALSE}
+library(DESeq2)
+library("pheatmap")
+library("RColorBrewer")
+library("PoiClaClu")
+library("ggplot2")
+
+library(edgeR)
+# library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(stringr)
+library(gplots)
+# Gene annotation is from C:\Eukaryote\miRNA-mRNA-circRNA-lncRNA\data\star\human.gene.info.txt
+```
+
+
+## Exploratory analysis and visualization
+```{r, warning=FALSE}
+rawcount<-read.delim("merged-count-sampleOrder.tab", row.names = "EnsemblID")
+
+# Remove all features that have a count of less than say 5 in more than 50% samples in this case
+sel.countCutoff <- rowSums(rawcount > 5) >= 7
+filterCount <- rawcount[sel.countCutoff, ]
+
+write.table(cbind(EnsemblID=rownames(filterCount), filterCount), sep="\t", 
+            row.names = FALSE, quote = FALSE, file="filter-count.txt")
+
+
+grp.idx <- rep(c("HBV+AdjacentTissue","HBV+HCCTissue"), c(4,8))
+
+coldat = DataFrame(grp=factor(grp.idx))
+rownames(coldat) <- colnames(filterCount)
+
+ddsinput <- DESeqDataSetFromMatrix(filterCount, colData=coldat, design = ~ grp)
+ddsmain <- DESeq(ddsinput)
+
+# perform the rlog transformation and used as gene expression matrix for heatmap and PCA application
+rld<-rlog(ddsmain, blind=FALSE)
+head(assay(rld), 3)
+
+# write the r log matrix to output
+rldmatrix <- assay(rld)
+rlddf <- as.data.frame(rldmatrix)
+
+
+# Sample distances
+# A useful first step in an RNA-seq analysis is often to assess overall similarity between samples: Which samples are similar to each other, which are different? Does this fit to the expectation from the experiment's design?
+
+# We use the R function dist to calculate the Euclidean distance between samples. To ensure we have a roughly equal contribution from all genes, we use it on the rlog-transformed data. 
+
+sampleDists <- dist( t( assay(rld) ) )
+sampleDists
+#We visualize the distances in a heatmap in a Figure below, using the function pheatmap from the pheatmap package.
+sampleDistMatrix <- as.matrix( sampleDists )
+rownames(sampleDistMatrix) <- rownames(coldat)
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors, 
+         fontsize = 15)
+```
+
+###  Heatmap of sample-to-sample distances using the rlog-transformed values
+
+
+```{r, warning=FALSE}
+# Another option for calculating sample distances is to use the Poisson Distance (Witten 2011), implemented in the PoiClaClu package. This measure of dissimilarity between counts also takes the inherent variance structure of counts into consideration when calculating the distances between samples. The PoissonDistance function takes the original count matrix (not normalized) with samples as rows instead of columns, so we need to transpose the counts in dds.
+
+poisd <- PoissonDistance(t(filterCount))
+
+# We plot the heatmap in a Figure below.
+samplePoisDistMatrix <- as.matrix( poisd$dd )
+rownames(samplePoisDistMatrix) <- rownames(coldat)
+colnames(samplePoisDistMatrix) <- NULL
+pheatmap(samplePoisDistMatrix,
+         clustering_distance_rows=poisd$dd,
+         clustering_distance_cols=poisd$dd,
+         col=colors)
+
+
+```
+### Heatmap of sample-to-sample distances using the Poisson Distance
+
+
+
+# PCA plot
+
+## Another way to visualize sample-to-sample distances is a principal components analysis (PCA). 
+
+```{r, warning=FALSE}
+plotPCA(rld, intgroup="grp")
+
+```
+
+### PCA plot using the rlog-transformed values. Each sample is color-coded according to their affiliations.
+
+
+# MDS plot
+## Another plot, very similar to the PCA plot, can be made using the multidimensional scaling (MDS) function in base R. This is useful when we don¡¯t have a matrix of data, but only a matrix of distances. Here we compute the MDS for the distances calculated from the rlog transformed counts and plot these in a Figure below.
+
+```{r, warning=FALSE}
+mdsData <- data.frame(cmdscale(sampleDistMatrix))
+mds <- cbind(mdsData, as.data.frame(colData(rld)))
+ggplot(mds, aes(X1,X2,
+                color=grp)) + geom_point(size=3) +  coord_fixed()
+```
+
+
+# Differential expression analysis
+# Running the differential expression pipeline
+
+Detection of DE mRNA genes between HBV driven HCC tissue and adjacent tissue
+Gene model is from GENCODE v24
+
+```{r, warning=FALSE}
+# HBV+AdjacentTissue as control and HBV+HCCTissue as treatment
+grp.idx <- factor(rep(c("HBV+AdjacentTissue","HBV+HCCTissue"), c(4,8)))
+# To perform likelihood ratio test under the glm framework
+dgel = DGEList(counts=filterCount, group = grp.idx)
+dgel <- calcNormFactors(dgel)
+designMrna <- model.matrix(~grp.idx)
+dgel <- estimateDisp(dgel, designMrna)
+dgel$samples
+
+# The fit has three parameters. The first group is the baseline level of group 1. The second and 
+# third are the 2vs1 and 3vs1 difference.
+fit <- glmFit(dgel, designMrna)
+lrt.HCCvsAdjacentT <- glmLRT(fit, coef = 2)
+
+# take a closer look at the counts-per-million (CPM) in individual samples for the top genes
+o <- order(lrt.HCCvsAdjacentT$table$PValue)
+cpm(dgel)[o[1:10],]
+
+# Users should also filter with CPM rather than filtering on the counts directly, as the latter does
+# not account for differences in library sizes between samples
+# P68 at the edgeRusersGuide.pdf
+ keep <- rowSums(cpm(dgel) > 1) >= 7
+ dgel.cpm <- dgel[keep, , keep.lib.sizes=FALSE]
+ 
+ # summarize the number of expressed genes and samples
+ dim(dgel.cpm$counts)
+
+fit.cpm <- glmFit(dgel.cpm, designMrna)
+lrt.cpm.HCCvsAdjacentT <- glmLRT(fit.cpm, coef = 2)
+
+# comparison using HCCpositive as treatment and HCC_adjacent as control
+de <- decideTestsDGE(lrt.cpm.HCCvsAdjacentT, adjust.method="BH", p.value=0.01)
+
+# We can also summarize the results with the following line of code, which reports some additional information, that will be covered in later sections.
+# The total number of differentially expressed genes at 1% FDR is given by
+summary(de)   # 560 up-regulated and 688 down-regulated genes
+
+# save the results for all expressed genes
+deTableFull <- topTags(lrt.cpm.HCCvsAdjacentT, n = 200000, p.value = 1, sort.by = "PValue")
+deTableFull <- deTableFull$table
+
+write.table(cbind(EnsemblGeneID=rownames(deTableFull), deTableFull),sep="\t",
+            quote = FALSE, na = "NA", row.names=FALSE,file="GE-HCCvsAdjcent-allGenes.txt")
+
+
+
+# Add the biotype for all genes
+ensemblGene <- read.delim("./star/human.gene.info.txt", row.names = "Ensembl_id")
+
+indexGenetype <- match(rownames(deTableFull), rownames(ensemblGene)) 
+deTableFull$geneType <- ensemblGene[indexGenetype,]$Gene_type
+
+
+# Create a table for protein function classification using PANTHER
+expressedProtein <- rownames(deTableFull[deTableFull$geneType == "protein_coding",])
+write.table(expressedProtein,sep="\t", col.names = FALSE,
+            quote = FALSE, row.names=FALSE,file="./PANTHER/expressedProtein.txt")
+
+expressedProteinLogFC <- deTableFull[deTableFull$geneType == "protein_coding",]
+head(expressedProteinLogFC)
+
+write.table(cbind(rownames(expressedProteinLogFC), expressedProteinLogFC$logFC),sep="\t", col.names = FALSE,
+            quote = FALSE, row.names=FALSE,file="./PANTHER/expressedProtein2LogFC.txt")
+
+
+
+deTable <- topTags(lrt.cpm.HCCvsAdjacentT, n = 200000, p.value = 0.01, sort.by = "PValue")
+# deTable <- subset(deTable$table, abs(logFC) > 1.0)
+deTable <- deTable$table   # 1,248 DE ensembl genes!
+
+# Add entrez gene ID
+deTable$entrezGene <- mapIds(org.Hs.eg.db,
+                                  keys=rownames(deTable),
+                                  column="ENTREZID",
+                                  keytype="ENSEMBL",
+                                  multiVals="first")
+
+
+
+ensemblCoordinate <- as.data.frame(apply(ensemblGene[,c(3:5)], 1, paste, collapse = " "))
+colnames(ensemblCoordinate) <- "ensemblCoordinate"
+ensemblGene$ensembl_gene_coordinate <- ensemblCoordinate$ensemblCoordinate
+
+ensemble.index <- match(rownames(deTable), rownames(ensemblGene))
+deTable2geneInfo <- cbind(deTable, ensemblGene[ensemble.index,])
+
+
+# Using the color-coded histogram (circos) to show the rank of differential expression changes of DEGs based on normalized FDR
+deTable2geneInfo$adjFDR = deTable2geneInfo$FDR
+deTable2geneInfo$adjFDR[deTable2geneInfo$FDR < 1e-5] <- 1e-5
+deTable2geneInfo$logFDR = log10(deTable2geneInfo$adjFDR)
+deTable2geneInfo$normalizedFDR = 1 - (deTable2geneInfo$logFDR - min(deTable2geneInfo$logFDR))/(max(deTable2geneInfo$logFDR) - min(deTable2geneInfo$logFDR))
+# add regulatory orientation based on positive/negative of FC
+deTable2geneInfo$normalizedFDR[deTable2geneInfo$logFC < 0] = -((deTable2geneInfo$normalizedFDR[deTable2geneInfo$logFC < 0]) + 0.1) 
+deTable2geneInfo$normalizedFDR[deTable2geneInfo$logFC > 0] = deTable2geneInfo$normalizedFDR[deTable2geneInfo$logFC > 0] + 0.1
+
+head(deTable2geneInfo)
+
+write.table(cbind(EnsemblID=rownames(deTable2geneInfo), deTable2geneInfo),sep="\t",
+            quote = FALSE, na = "NA", row.names=FALSE,file="GE-HCCvsAdjcent-FDR0.01.txt")
+
+
+
+# keep protein-coding and lncRNA genes
+# For protein-coding genes, dependent on 'protein-coding' in the column Gene_type, which is extracted from the GTF file
+deTable2pcInfo <- deTable2geneInfo[deTable2geneInfo$Gene_type == "protein_coding", ]
+# For lncRNA gene id, which is extracted from the FASTA file
+lncRNAid<-read.delim("lncRNA-id-ensembl.list")
+deTable2lncInfo <- deTable2geneInfo[na.omit(match(as.character(lncRNAid$EnsemblID), rownames(deTable2geneInfo))), ]
+
+# combine two data frame
+deTable2totalInfo <- rbind(deTable2pcInfo, deTable2lncInfo)
+length(unique(rownames(deTable2totalInfo[(deTable2totalInfo$logFC > 0), ])))  #1172
+length(unique(rownames(deTable2totalInfo[(deTable2totalInfo$logFC < 0), ])))   #781
+
+write.table(cbind(EnsemblID=rownames(deTable2pcInfo), deTable2pcInfo),sep="\t",
+            quote = FALSE, na = "NA", row.names=FALSE,file="protein-coding-genes-FDR0.01.txt")
+
+write.table(cbind(EnsemblID=rownames(deTable2lncInfo), deTable2lncInfo),sep="\t",
+            quote = FALSE, na = "NA", row.names=FALSE,file="lncRNA-genes-FDR0.01.txt")
+
+
+
+
+
+# heatmap for DE genes
+logCPMmRNA <- as.data.frame(cpm(dgel, prior.count = 2, log = TRUE))
+
+deTable2totalInfo = deTable2totalInfo[order(deTable2totalInfo$logFC),]
+# the matched id in the first variable is completely included in the second variable if using match function
+logCPMmiRNAindex <- match(rownames(deTable2totalInfo), rownames(logCPMmRNA))
+cpmDEmRNA <- logCPMmRNA[logCPMmiRNAindex,] #1953
+dim(cpmDEmRNA)
+
+
+# for DE genes only
+windows()
+heatmap.2(as.matrix(cpmDEmRNA), Rowv = FALSE, Colv = TRUE,
+          hclustfun = hclust,
+          col="greenred", colsep=1:6, sepcolor="grey", scale = "row",
+          sepwidth=c(0.0025,0.0025), cexCol= 1.2, cexRow = 0.9, 
+          labRow = FALSE,
+          margins = c(1, 3),
+          dendrogram="both", trace="none", main="",
+          key = TRUE,
+          keysize = 1.0,
+          key.title = "",
+          density.info = "none",
+          key.par=list(mar=c(3.5,14,4.5,14)),         #control the shape (thickness and length) and position of color key
+          lmat=rbind(c(0,3),c(2,1),c(0,4)), lwid=c(0.5,6), lhei=c(1, 3, 1)  #It is a 2-rows (lwid(the first number corresponding to the width of the first column and the second number for the width of the second column)) and 3-columns matrix
+          )
+dev.off()
+
+
+
+# for circos application
+# lncRNAs
+# the list of lncRNA gene identifiers from Gencode
+lncRNAlist <- read.table("./lncRNA-id-ensembl.list", quote=NULL, header=FALSE, check.names=F, sep="\t")
+colnames(lncRNAlist) <- "EnsemblGeneID"
+
+deTable2totalInfo$EnsemblGeneID = rownames(deTable2totalInfo)
+lncRNAgeneTable <- merge(deTable2totalInfo, lncRNAlist, by = "EnsemblGeneID")
+circos.lncRNAs <- unique(lncRNAgeneTable$ensembl_gene_coordinate)
+head(circos.lncRNAs)
+write.table(circos.lncRNAs, sep="\t",
+            quote = FALSE, col.names = FALSE, row.names=FALSE,file="./circos/DElncRNAs.txt")
+
+
+# protein-coding mRNAs
+# the list of protein-coding gene identifiers from Gencode
+codingRNAlist <- read.table("./pcRNA-id-ensembl.list", quote=NULL, header=FALSE, check.names=F, sep="\t")
+colnames(codingRNAlist) <- "EnsemblGeneID"
+proteinGeneTable <- merge(deTable2totalInfo, codingRNAlist, by = "EnsemblGeneID")
+
+circos.proteinGene <- unique(proteinGeneTable$ensembl_gene_coordinate)
+head(circos.proteinGene)
+write.table(circos.proteinGene, sep="\t",
+            quote = FALSE, col.names = FALSE, row.names=FALSE,file="./circos/DEproteinRNAs.txt")
+```
+
+
+
+# Detection of DE miRNAs between HBV driven HCC tissue and adjacent tissue
+```{r, warning=FALSE}
+miRNAcount <- read.table("./smallRNA-seq/miRNAs_expressed_all_samples_formatted.txt", quote=NULL, header=TRUE, check.names=F, sep="\t")
+
+# sum the number of mapped reads per sample
+sum(miRNAcount$s01)
+
+#miRNA.precursor <- as.data.frame(apply(miRNAcount[,c(1,3)], 1, paste, collapse = "."))
+#colnames(miRNA.precursor) <- "miRNA_new_ID"
+#miRNAcount$miRNA_new_ID <- miRNA.precursor
+miRNAmat <- miRNAcount[,c(6:9)]
+
+# check the consistency of miRNA id between 2822miRNA-HCCvsAdjcent-GE.txt and GE-miRNA-HCCvsAdjcent-FDR0.05.txt
+head(miRNAcount)
+write.table(cbind(Number=rownames(miRNAcount), miRNAcount), sep="\t",
+            quote = FALSE, row.names=FALSE, file="2822miRNA-HCCvsAdjcent-GE.txt")
+
+# removing all features that have a count of less than say 5 in more than 50% samples in this case
+miRNA.countCutoff <- rowSums(miRNAmat > 5) >= 2      
+filter.miRNA <- miRNAmat[miRNA.countCutoff, ]   #718 expressed miRNAs
+
+miRNA.grp.idx <- factor(rep(c("miRNA-HBV+AdjacentT","miRNA-HBV+HCC"), c(2,2)))
+# To perform likelihood ratio test under the glm framework
+dgel.miRNA = DGEList(counts=filter.miRNA, group = miRNA.grp.idx)
+dgel.miRNA <- calcNormFactors(dgel.miRNA)
+design.miRNA <- model.matrix(~miRNA.grp.idx)
+dgel.miRNA <- estimateDisp(dgel.miRNA, design.miRNA)
+
+
+keep.miRNA <- rowSums(cpm(dgel.miRNA) > 1) >= 2
+dgel.miRNA.cpm <- dgel.miRNA[keep.miRNA, , keep.lib.sizes=FALSE]   #708 miRNAs with CPM > 0.5 
+
+
+fit.miRNA.cpm <- glmFit(dgel.miRNA.cpm, design.miRNA)
+lrt.miRNA.cpm.HCCvsAdjacentT <- glmLRT(fit.miRNA.cpm, coef = 2)
+topTags(lrt.miRNA.cpm.HCCvsAdjacentT)
+
+miRNAdeTable <- topTags(lrt.miRNA.cpm.HCCvsAdjacentT, n = 500, p.value = 0.05, sort.by = "PValue")
+miRNAdeTable <- miRNAdeTable$table
+
+miRNAIDIndex <- match(rownames(miRNAdeTable), rownames(miRNAcount))
+miRNAdeTable$miRNA_full_id <- miRNAcount[miRNAIDIndex,]$miRNA_full_id
+miRNAdeTable$mature_miRNA_id <- miRNAcount[miRNAIDIndex,]$miRNA
+miRNAdeTable$miRNA_precursor <- miRNAcount[miRNAIDIndex,]$precursor
+
+# 20 DE miRNAs
+miRNACoordinate <- read.table("miRBase/human-miRNA-info.txt", quote=NULL, header=TRUE, check.names=F,  sep="\t")
+miRNACoordinate2 <- as.data.frame(apply(miRNACoordinate[,c(4:6)], 1, paste, collapse = " "))
+colnames(miRNACoordinate2) <- "miRNA_coordinate"
+miRNACoordinate$miRNA_coordinate <- miRNACoordinate2$miRNA_coordinate
+miRNADE2coordinate <- merge(miRNAdeTable, miRNACoordinate, by= "miRNA_full_id")
+
+
+#Heatmap of DE miRNAs
+# using moderated log-counts-per-million to draw a heatmap of individual RNA-seq samples
+logCPMmiRNA <- as.data.frame(cpm(dgel.miRNA, prior.count = 2, log = TRUE))
+logCPMmiRNAindex <- match(rownames(logCPMmiRNA), rownames(miRNAcount))
+logCPMmiRNA$miRNA_full_id <- as.character(miRNAcount[logCPMmiRNAindex,]$miRNA_full_id)
+logCPMmiRNA$miRNA_id <- as.character(miRNAcount[logCPMmiRNAindex,]$miRNA)
+
+miRNADE2coordinate = miRNADE2coordinate[order(miRNADE2coordinate$logFC),]
+logCPMdeMiRNAindex <- match(miRNADE2coordinate$miRNA_full_id, logCPMmiRNA$miRNA_full_id)
+miRNAheatmapMat <- logCPMmiRNA[logCPMdeMiRNAindex,]
+miRNAheatmapMat$name <- str_replace_all(miRNAheatmapMat$miRNA_full_id, "\\.", " / ")
+
+deMiRNAlist <- miRNAheatmapMat[,1:4]
+colnames(deMiRNAlist) <- c("S_1_N", "S_2_N", "S_1_T", "S_2_T")
+
+
+windows()
+heatmap.2(as.matrix(deMiRNAlist), Rowv = FALSE, Colv = TRUE,
+          hclustfun = hclust,
+          col="greenred", colsep=1:6, sepcolor="grey", scale = "row",
+          sepwidth=c(0.0025,0.0025), cexCol= 1.2, cexRow = 1.0, 
+          labRow = miRNAheatmapMat$name,
+          margins = c(1, 15),
+          dendrogram="both", trace="none", main="",
+          key = TRUE,
+          keysize = 1.0,
+          key.title = "",
+          density.info = "none",
+          key.par=list(mar=c(3.5,8,4.5,18)),         #control the shape (thickness and length) and position of color key
+          lmat=rbind(c(0,3),c(2,1),c(0,4)), lwid=c(0.5,6), lhei=c(1, 3, 1)  #It is a 2-rows (lwid(the first number corresponding to the width of the first column and the second number for the width of the second column)) and 3-columns matrix
+          )
+dev.off()
+
+head(miRNADE2coordinate)
+write.table(miRNADE2coordinate,sep="\t",
+            quote = FALSE, row.names=FALSE,file="GE-miRNA-HCCvsAdjcent-FDR0.05.txt")
+
+
+
+# Circos application
+# create a text file containing unique chromosomal coordinates for each DE miRNAs for circos plot
+circos.miRNAs <- unique(miRNADE2coordinate$miRNA_coordinate)   # 20 miRNAs
+head(circos.miRNAs)
+write.table(circos.miRNAs,sep="\t",
+            quote = FALSE, col.names = FALSE, row.names=FALSE,file="./circos/DEmiRNAs.txt")
+
+# create circos gene symbol text file
+circos.miRNALableUp <- subset(miRNADE2coordinate, logFC > 0)
+circos.miRNALableUp <- paste(circos.miRNALableUp$miRNA_coordinate, circos.miRNALableUp$mature_miRNA_id.x, "color=red", sep = " ")
+circos.miRNALableUp <- unique(circos.miRNALableUp)
+
+circos.miRNALableDown <- subset(miRNADE2coordinate, logFC < 0)
+circos.miRNALableDown <- paste(circos.miRNALableDown$miRNA_coordinate, circos.miRNALableDown$mature_miRNA_id.x, "color=vvdpgreen", sep = " ")
+circos.miRNALableDown <- unique(circos.miRNALableDown)
+
+head(circos.miRNALableUp)
+write.table(c(circos.miRNALableUp, circos.miRNALableDown), sep="\t",
+            quote = FALSE, col.names = FALSE, row.names=FALSE,file="./circos/miRNALables.txt")
+
+```
+
+
+# Heatmap representing DEGs which are color-coded by correct p-value in the circos plot
+```{r, warning=FALSE}
+
+# Using the histogram to show the rank of differential expression changes based on normalized FDR
+# create file for histogram in the circos plot
+head(deTable2totalInfo[,c(13,16)])
+write.table(deTable2totalInfo[,c(13,16)], sep=" ",
+            quote = FALSE, col.names = FALSE, row.names=FALSE,file="./circos/geneHistogram.txt")
+
+miRNADE2coordinate$adjFDR = miRNADE2coordinate$FDR
+miRNADE2coordinate$adjFDR[miRNADE2coordinate$FDR < 1e-5] <- 1e-5
+miRNADE2coordinate$logFDR = log10(miRNADE2coordinate$adjFDR)
+miRNADE2coordinate$normalizedFDR = 1 - (miRNADE2coordinate$logFDR - min(miRNADE2coordinate$logFDR))/(max(miRNADE2coordinate$logFDR) - min(miRNADE2coordinate$logFDR))
+# add regulatory orientation based on positive/negative of FC
+miRNADE2coordinate$normalizedFDR[miRNADE2coordinate$logFC < 0] = -((miRNADE2coordinate$normalizedFDR[miRNADE2coordinate$logFC < 0]) + 0.1) 
+miRNADE2coordinate$normalizedFDR[miRNADE2coordinate$logFC > 0] = miRNADE2coordinate$normalizedFDR[miRNADE2coordinate$logFC > 0] + 0.1
+
+write.table(miRNADE2coordinate[,c(15,18)], sep=" ",
+            quote = FALSE, col.names = FALSE, row.names=FALSE,file="./circos/miRNAHistogram.txt")
+
+# combine two files in MS DOS
+# C:\Eukaryote\miRNA-mRNA-circRNA-lncRNA\2ndAnalysis\circos>copy /b geneHistogram.txt + miRNAHistogram.txt Histogram.txt
+```
+
+
+
+# Predicted interactions between DE miRNAs and mRNAs, lncRNAs based on miRanda
+# Detecting negatively correlated miRNA-target pairs based on gene expression patterns
+```{r, warning=FALSE}
+miRNAtargets <-read.table("targetPrediction/combined-miRNA-target-final.txt", quote=NULL, header=FALSE, check.names=F,  sep="\t")  #5394 interactions
+names(miRNAtargets)[1:5] = c("miRNA_id",	"Interaction",	"EnsemblID",	"Prediction_methods",	"Prediction_methods_number")
+
+
+uniqueMiRNA <- unique(miRNAtargets$miRNA_id)  # 17 miRNAs
+uniqueEnsemblGene <- unique(miRNAtargets$EnsemblID) # 1517 genes
+uniqueLncRNAGene <- unique(as.character((subset(miRNAtargets, Interaction == "lncRNA"))$EnsemblID))  #79
+uniqueProteinGene <- unique(as.character((subset(miRNAtargets, Interaction == "protein-coding"))$EnsemblID)) #1438
+#uniqueEnsemblTranscript <- unique(miRandalist$EnsemblTranscriptID)
+
+
+# add logFC to miRNAs
+indexMiRNA <- match(miRNAtargets$miRNA_id, miRNADE2coordinate$mature_miRNA_id.x)
+miRNAtargets$logFC_miRNA <- miRNADE2coordinate[indexMiRNA,]$logFC
+
+# add logFC to genes
+indexEnsemblG <- match(miRNAtargets$EnsemblID, rownames(deTable2totalInfo))
+miRNAtargets$logFC_EnsemblG <- deTable2totalInfo[indexEnsemblG,]$logFC
+
+
+miRNAupTargetDown <- subset(miRNAtargets, ((logFC_miRNA >= 1) & (logFC_EnsemblG <= -1)))
+miRNAdownTargetUp <- subset(miRNAtargets, ((logFC_miRNA <= -1) & (logFC_EnsemblG >= 1)))
+
+# negatively correlated miRNA and target interactions
+# use this create an interaction network
+negatCorMiRNAtarget <- subset(miRNAtargets, (((logFC_miRNA >= 1) & (logFC_EnsemblG <= -1))) | ((logFC_miRNA <= -1) & (logFC_EnsemblG >= 1)))
+
+# add gene symbol
+indexSymbol <- match(negatCorMiRNAtarget$EnsemblID, rownames(deTable2totalInfo))
+negatCorMiRNAtarget$Symbol <- deTable2totalInfo[indexSymbol,]$Gene_name
+negatCorMiRNAtarget$Gene_type <- deTable2totalInfo[indexSymbol,]$Gene_type
+
+head(negatCorMiRNAtarget)
+write.table(negatCorMiRNAtarget, sep="\t",
+            quote = FALSE, row.names=FALSE, file="miRNA-target-interactions.txt")
+
+
+length(unique(negatCorMiRNAtarget$miRNA_id))   #17 miRNAs
+length(unique(negatCorMiRNAtarget$EnsemblID))     # 682 genes
+length(unique(subset(negatCorMiRNAtarget, Interaction == "lncRNA")$EnsemblID))  # 38 lncRNAs 
+length(unique(subset(negatCorMiRNAtarget, Interaction == "protein-coding")$EnsemblID))  # and 644 protein-coding
+
+subset1 <- subset(negatCorMiRNAtarget, logFC_EnsemblG < 0)
+length(unique(subset(subset1, Interaction == "lncRNA")$EnsemblID))    #47 down-regulated lncRNAs and thus 22 up-regulated lncRNAs
+
+# export the list of protein-coding genes negatively regulated by miRNA
+dysproteinG <- unique(subset(negatCorMiRNAtarget, Interaction == "protein-coding")$EnsemblID)
+write.table(dysproteinG, col.names = FALSE,sep = "\t",
+            quote = FALSE, row.names=FALSE,file="./clusterProfile/dysprotein-genes.txt")
+
+
+
+# Edge table
+negatCorMiRNAtarget$Gene_type = paste("miRNA-", negatCorMiRNAtarget$Interaction, sep = "")
+
+edge.interaction <- negatCorMiRNAtarget[,c(1:3)]
+edge.interaction <- unique(edge.interaction)                    
+edge.interaction$miRNA_id <- substring(edge.interaction$miRNA_id,5)
+length(unique(edge.interaction$miRNA_id)) # 17
+length(unique(edge.interaction$EnsemblID)) #1047
+
+write.table(edge.interaction, col.names = TRUE,sep = "\t",
+            quote = FALSE, row.names=FALSE,file="./cytoscape/edges.txt")
+
+
+# Node table
+node.miRNAs <- unique(negatCorMiRNAtarget[,c(1,6)])
+node.miRNAs$mature_miRNA_id <- substring(node.miRNAs$miRNA_id,5)
+node.miRNAs <- as.data.frame(node.miRNAs)
+node.miRNAs$Gene_type <- "microRNA"
+node.miRNAs$Gene_name <- node.miRNAs$mature_miRNA_id
+node.miRNAs <- node.miRNAs[,c(3:5,2)]
+
+write.table(node.miRNAs, col.names = TRUE, sep = "\t",
+            quote = FALSE, row.names=FALSE,file="./cytoscape/nodes.miRNAs.txt")
+# to create a cytoscape network smoothly, manually adjust the miRNA name for those who can map to multiple precursors, e.g. hsa-miR-105-3p, hsa-miR-199a-3p. Keep the ones with the largest |logFC|
+
+node.targets <- negatCorMiRNAtarget[,c(8,9,3,7)]
+node.targets <- unique(node.targets)
+
+miRNAtargetTF <-read.table("panther/pantherGeneList_TFs.txt", quote=NULL, header=FALSE, check.names=F,  sep="\t")  #70 DE TF
+
+
+# Actually, we don't care the fold change of genes to reflect the regulation trend of a gene. The key is FDR of a gene. Especially we have very few samples!!!
+# Add label to the genes encoding TF
+node.targets$Gene_type = substring(node.targets$Gene_type, 7)
+# among 70 DE TFs, 29 are targeted by miRNAs
+node.targets[na.omit(match(miRNAtargetTF$V2,node.targets$EnsemblID)),]$Gene_type <- "TF"
+
+write.table(node.targets, col.names = TRUE,sep = "\t",
+            quote = FALSE, row.names=FALSE,file="./cytoscape/nodes.targets.txt")
+
+
+
+
+# create circos linkages file containing pairwise coordinates for miRNA-target interaction
+# cyan linkage for miRNA:lncRNA
+# pink linkage for miRNA:pcRNA
+
+negatCorMiRNAtarget$ensembl_coordinate = deTable2totalInfo[match(negatCorMiRNAtarget$EnsemblID, rownames(deTable2totalInfo)),]$ensembl_gene_coordinate
+
+miRNA3coordinate = miRNADE2coordinate[,c(7,15)]
+colnames(miRNA3coordinate)[1] <- "miRNA_id"
+negatCorMiRNAtarget2 = merge(negatCorMiRNAtarget, miRNA3coordinate, by = "miRNA_id")
+
+
+negatCorMiRNAtargetLncRNA <- subset(negatCorMiRNAtarget2, Interaction == "lncRNA")
+negatCorMiRNAtargetPcRNA <- subset(negatCorMiRNAtarget2, Interaction == "protein-coding")
+
+
+circos.lncRNAsLinkageAll <- paste(negatCorMiRNAtargetLncRNA$miRNA_coordinate, negatCorMiRNAtargetLncRNA$ensembl_coordinate, sep = " ")
+circos.lncRNAsLinkage <- unique(circos.lncRNAsLinkageAll)
+head(circos.lncRNAsLinkage)
+
+write.table(circos.lncRNAsLinkage,sep="\t",
+            quote = FALSE, col.names = FALSE, row.names=FALSE,file="./circos/miRNA-lncRNAs.txt")
+
+circos.proteinGeneLinkageAll <- paste(negatCorMiRNAtargetPcRNA$miRNA_coordinate, negatCorMiRNAtargetPcRNA$ensembl_coordinate, sep = " ")
+circos.proteinGeneLinkage <- unique(circos.proteinGeneLinkageAll)
+
+write.table(circos.proteinGeneLinkage, sep="\t",
+            quote = FALSE, col.names = FALSE, row.names=FALSE, file="./circos/miRNA-proteinGenes.txt")
+
+
+#Only links between TFs and miRNAs
+deTF <- as.data.frame(miRNAtargetTF$V2)
+colnames(deTF) <- "EnsemblID"
+
+miRNA2TFs <- merge(negatCorMiRNAtarget2, deTF, by = "EnsemblID")
+circos.proteinGeneLinkageAll <- paste(miRNA2TFs$miRNA_coordinate, miRNA2TFs$ensembl_coordinate, sep = " ")
+circos.proteinGeneLinkage <- unique(circos.proteinGeneLinkageAll)
+head(circos.proteinGeneLinkage)
+write.table(circos.proteinGeneLinkage, sep="\t",
+            quote = FALSE, col.names = FALSE, row.names=FALSE, file="./circos/miRNA-TFs.txt")
+
+
+# create circos gene symbol text file
+# for genes negatively correlated with miRNAs
+# protein-coding genes
+length(unique(negatCorMiRNAtargetPcRNA$Symbol))   #978
+circos.PcRNALableUp <- subset(negatCorMiRNAtargetPcRNA, logFC_EnsemblG > 0)
+circos.PcRNALableUp <- paste(circos.PcRNALableUp$ensembl_coordinate, circos.PcRNALableUp$Symbol, "color=red", sep = " ")
+circos.PcRNALableUp <- unique(circos.PcRNALableUp)
+
+
+circos.PcRNALableDown <- subset(negatCorMiRNAtargetPcRNA, logFC_EnsemblG < 0)
+circos.PcRNALableDown <- paste(circos.PcRNALableDown$ensembl_coordinate, circos.PcRNALableDown$Symbol, "color=vvdpgreen", sep = " ")
+circos.PcRNALableDown <- unique(circos.PcRNALableDown)
+
+
+write.table(c(circos.PcRNALableUp,circos.PcRNALableDown) ,sep="\t",
+            quote = FALSE, col.names = FALSE, row.names=FALSE,file="./circos/ProteinRNALables.txt")
+
+# only show TF
+miRNAtargetTF <-read.table("panther/pantherGeneList_TFs.txt", quote=NULL, header=FALSE, check.names=F,  sep="\t")  #31 TF
+negatCorMiRNAtargetPcTF <- negatCorMiRNAtargetPcRNA[match(miRNAtargetTF$V2, negatCorMiRNAtargetPcRNA$EnsemblID),]
+
+circos.PcRNALableUp <- subset(negatCorMiRNAtargetPcTF, logFC_EnsemblG > 0)
+circos.PcRNALableUp <- paste(circos.PcRNALableUp$ensembl_coordinate, circos.PcRNALableUp$Symbol, "color=red", sep = " ")
+circos.PcRNALableUp <- unique(circos.PcRNALableUp)
+
+
+circos.PcRNALableDown <- subset(negatCorMiRNAtargetPcTF, logFC_EnsemblG < 0)
+circos.PcRNALableDown <- paste(circos.PcRNALableDown$ensembl_coordinate, circos.PcRNALableDown$Symbol, "color=vvdpgreen", sep = " ")
+circos.PcRNALableDown <- unique(circos.PcRNALableDown)
+
+head(circos.PcRNALableUp)
+head(circos.PcRNALableDown)
+write.table(c(circos.PcRNALableUp,circos.PcRNALableDown) ,sep="\t",
+            quote = FALSE, col.names = FALSE, row.names=FALSE,file="./circos/TFLables.txt")
+
+
+```
+
